@@ -1,0 +1,738 @@
+From 7fa89979b42265dc82312267f53c1dc8aae121c5 Mon Sep 17 00:00:00 2001
+From: TranAnhDuy123 <tranminhhuyen22@gmail.com>
+Date: Fri, 25 Sep 2026 15:56:02 +0700
+Subject: [PATCH 2/3] Plane: INDI body-rate loop for lift motors and control
+ surfaces
+
+Q_INDI_ENABLE=0 (default) allocates the stock AC_AttitudeControl_TS and
+leaves every stock code path unchanged.
+
+With Q_INDI_ENABLE=1:
+- AC_AttitudeControl_INDI (subclass of AC_AttitudeControl_TS) runs INDI
+  on the axes in Q_INDI_AXES with non-zero effectiveness while the lift
+  motors are spooled up; other axes keep the stock PID. The fed-back
+  effector state is the roll/pitch input the mixer actually applied,
+  recovered from the motor outputs.
+- AP_FW_Controller runs INDI on aileron/elevator in fixed-wing flight
+  proper (transition complete, no assist, not a VTOL mode), with
+  effectiveness scaled by 1/speed_scaler^2.
+- The effector feedback passes through the same filters and delays as
+  the angular-acceleration estimate (actuator model, backward-difference
+  half sample, INS gyro low-pass, INDI low-pass).
+- New logs INDI (VTOL) and INDF (fixed wing).
+
+Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>
+---
+ ArduPlane/Attitude.cpp                        |  41 ++++
+ ArduPlane/quadplane.cpp                       |  11 +-
+ ArduPlane/quadplane.h                         |   4 +
+ .../AC_AttitudeControl_INDI.cpp               | 124 +++++++++++
+ .../AC_AttitudeControl_INDI.h                 |  39 ++++
+ libraries/AC_AttitudeControl/AC_INDI.cpp      | 192 ++++++++++++++++++
+ libraries/AC_AttitudeControl/AC_INDI.h        |  90 ++++++++
+ libraries/APM_Control/AP_FW_Controller.cpp    |  32 ++-
+ libraries/APM_Control/AP_FW_Controller.h      |  20 ++
+ 9 files changed, 551 insertions(+), 2 deletions(-)
+ create mode 100644 libraries/AC_AttitudeControl/AC_AttitudeControl_INDI.cpp
+ create mode 100644 libraries/AC_AttitudeControl/AC_AttitudeControl_INDI.h
+ create mode 100644 libraries/AC_AttitudeControl/AC_INDI.cpp
+ create mode 100644 libraries/AC_AttitudeControl/AC_INDI.h
+
+diff --git a/ArduPlane/Attitude.cpp b/ArduPlane/Attitude.cpp
+index ec8768725d..2514d93897 100644
+--- a/ArduPlane/Attitude.cpp
++++ b/ArduPlane/Attitude.cpp
+@@ -442,6 +442,18 @@ void Plane::stabilize()
+     }
+     last_stabilize_ms = now;
+ 
++#if HAL_QUADPLANE_ENABLED
++    // INDI on the control surfaces only in fixed-wing flight proper: transition
++    // complete, no VTOL assist and not a VTOL mode. In VTOL modes and
++    // transitions the lift motors run INDI and the surfaces keep the stock PID,
++    // so only one INDI loop ever acts on an axis.
++    const bool fw_indi = quadplane.available() && quadplane.indi.enable > 0 &&
++                         !quadplane.in_vtol_mode() && quadplane.transition->complete() &&
++                         !quadplane.in_assisted_flight();
++    rollController.set_indi(&quadplane.indi, 0, fw_indi && quadplane.indi.axis_enabled(AC_INDI_Params::FW_ROLL));
++    pitchController.set_indi(&quadplane.indi, 1, fw_indi && quadplane.indi.axis_enabled(AC_INDI_Params::FW_PITCH));
++#endif
++
+     if (control_mode == &mode_training ||
+             control_mode == &mode_manual) {
+         plane.control_mode->run();
+@@ -470,6 +482,35 @@ void Plane::stabilize()
+         plane.control_mode->run();
+     }
+ 
++#if HAL_QUADPLANE_ENABLED && HAL_LOGGING_ENABLED
++    if (quadplane.available() && quadplane.indi.enable > 0) {
++        const auto &r = rollController.indi_axis();
++        const auto &p = pitchController.indi_axis();
++// @LoggerMessage: INDF
++// @Description: Fixed-wing INDI surface rate loop (surface normalised to full travel, rad/s/s)
++// @Field: TimeUS: Time since system startup
++// @Field: Act: axes running INDI (1 roll, 2 pitch)
++// @Field: RNu: roll desired angular acceleration
++// @Field: RWd: roll filtered measured angular acceleration
++// @Field: RU0: roll filtered applied aileron
++// @Field: RU: roll INDI aileron command
++// @Field: RG: roll effectiveness used
++// @Field: PNu: pitch desired angular acceleration
++// @Field: PWd: pitch filtered measured angular acceleration
++// @Field: PU0: pitch filtered applied elevator
++// @Field: PU: pitch INDI elevator command
++// @Field: PG: pitch effectiveness used
++// @Field: Scl: speed scaler
++        AP::logger().WriteStreaming("INDF", "TimeUS,Act,RNu,RWd,RU0,RU,RG,PNu,PWd,PU0,PU,PG,Scl",
++                                    "s------------", "F------------", "QBfffffffffff",
++                                    AP_HAL::micros64(),
++                                    uint8_t((rollController.indi_active() ? 1U : 0U) | (pitchController.indi_active() ? 2U : 0U)),
++                                    r.nu, r.wdot_f, r.u0_f, r.u, rollController.indi_G(),
++                                    p.nu, p.wdot_f, p.u0_f, p.u, pitchController.indi_G(),
++                                    get_speed_scaler());
++    }
++#endif
++
+     /*
+       see if we should zero the attitude controller integrators. 
+      */
+diff --git a/ArduPlane/quadplane.cpp b/ArduPlane/quadplane.cpp
+index 2543e49a4a..7456ed9e20 100644
+--- a/ArduPlane/quadplane.cpp
++++ b/ArduPlane/quadplane.cpp
+@@ -3,6 +3,7 @@
+ #if HAL_QUADPLANE_ENABLED
+ 
+ #include "AC_AttitudeControl/AC_AttitudeControl_TS.h"
++#include "AC_AttitudeControl/AC_AttitudeControl_INDI.h"
+ 
+ const AP_Param::GroupInfo QuadPlane::var_info[] = {
+ 
+@@ -579,6 +580,10 @@ const AP_Param::GroupInfo QuadPlane::var_info2[] = {
+     // @Range: 0 10
+     AP_GROUPINFO("RTL_PAUSE_TIME", 43, QuadPlane, qrtl_pause_time, 0),
+ 
++    // @Group: INDI_
++    // @Path: ../libraries/AC_AttitudeControl/AC_INDI.cpp
++    AP_SUBGROUPINFO(indi, "INDI_", 44, QuadPlane, AC_INDI_Params),
++
+     AP_GROUPEND
+ };
+ 
+@@ -728,7 +733,11 @@ bool QuadPlane::setup(void)
+         AP_BoardConfig::allocation_error("ahrs_view");
+     }
+ 
+-    attitude_control = NEW_NOTHROW AC_AttitudeControl_TS(*ahrs_view, *motors);
++    if (indi.enable > 0) {
++        attitude_control = NEW_NOTHROW AC_AttitudeControl_INDI(*ahrs_view, *motors, indi);
++    } else {
++        attitude_control = NEW_NOTHROW AC_AttitudeControl_TS(*ahrs_view, *motors);
++    }
+     if (!attitude_control) {
+         AP_BoardConfig::allocation_error("attitude_control");
+     }
+diff --git a/ArduPlane/quadplane.h b/ArduPlane/quadplane.h
+index 4b5acaefb2..4b13468c3e 100644
+--- a/ArduPlane/quadplane.h
++++ b/ArduPlane/quadplane.h
+@@ -11,6 +11,7 @@
+ #include <AP_Motors/AP_Motors.h>
+ #include <AC_PID/AC_PID.h>
+ #include <AC_AttitudeControl/AC_AttitudeControl_Multi.h> // Attitude control library
++#include <AC_AttitudeControl/AC_INDI.h>
+ #include <AC_AttitudeControl/AC_CommandModel.h>
+ #include <AP_InertialNav/AP_InertialNav.h>
+ #include <AC_AttitudeControl/AC_PosControl.h>
+@@ -214,6 +215,9 @@ private:
+     const struct AP_Param::GroupInfo *motors_var_info;
+ 
+     AC_AttitudeControl_Multi *attitude_control;
++
++    // INDI rate loop settings (Q_INDI_*); Q_INDI_ENABLE=0 keeps the stock controller
++    AC_INDI_Params indi;
+     AC_PosControl *pos_control;
+     AC_WPNav *wp_nav;
+     AC_Loiter *loiter_nav;
+diff --git a/libraries/AC_AttitudeControl/AC_AttitudeControl_INDI.cpp b/libraries/AC_AttitudeControl/AC_AttitudeControl_INDI.cpp
+new file mode 100644
+index 0000000000..56c0b84cbc
+--- /dev/null
++++ b/libraries/AC_AttitudeControl/AC_AttitudeControl_INDI.cpp
+@@ -0,0 +1,124 @@
++#include "AC_AttitudeControl_INDI.h"
++
++#include <AP_HAL/AP_HAL.h>
++#include <AP_InertialSensor/AP_InertialSensor.h>
++#include <AP_Logger/AP_Logger.h>
++#include <AP_Scheduler/AP_Scheduler.h>
++
++AC_AttitudeControl_INDI::AC_AttitudeControl_INDI(AP_AHRS_View &ahrs, AP_MotorsMulticopter& motors, const AC_INDI_Params &indi) :
++    AC_AttitudeControl_TS(ahrs, motors),
++    _indi(indi),
++    _active(0)
++{
++}
++
++float AC_AttitudeControl_INDI::applied_input(uint8_t axis)
++{
++    if (axis > 1) {
++        // no yaw factor accessor on the motor class: use the last request
++        return _motors.get_yaw() + _motors.get_yaw_ff();
++    }
++    // Each motor output is thr_lin.thrust_to_actuator(thrust_i), with
++    //   thrust_i = throttle*throttle_factor_i + scale*(roll*roll_factor_i + pitch*pitch_factor_i + yaw*yaw_factor_i)
++    // Projecting the recovered thrusts onto the roll (or pitch) factors gives the
++    // roll (or pitch) input that was actually applied, after any rescaling.
++    float num = 0.0f, den = 0.0f;
++    for (uint8_t i = 0; i < AP_MOTORS_MAX_NUM_MOTORS; i++) {
++        float act;
++        if (!_motors_multi.get_raw_motor_throttle(i, act)) {
++            continue;
++        }
++        const float f = (axis == 0) ? _motors_multi.get_roll_factor(i) : _motors_multi.get_pitch_factor(i);
++        if (is_zero(f)) {
++            continue;
++        }
++        num += f * _motors_multi.thr_lin.actuator_to_thrust(act);
++        den += f * f;
++    }
++    if (!is_positive(den)) {
++        return 0.0f;
++    }
++    const float comp = _motors_multi.thr_lin.get_compensation_gain();
++    return num / den / (is_positive(comp) ? comp : 1.0f);
++}
++
++void AC_AttitudeControl_INDI::rate_controller_run_dt(const Vector3f& gyro_rads, float dt)
++{
++    // same bookkeeping as AC_AttitudeControl_Multi::rate_controller_run_dt()
++    Vector3f ang_vel_body = _ang_vel_body_rads;
++    update_throttle_gain_boost();
++    update_throttle_rpy_mix();
++    ang_vel_body += _sysid_ang_vel_body_rads;
++    _rate_gyro_rads = gyro_rads;
++    _rate_gyro_time_us = AP_HAL::micros64();
++
++    const float loop_hz = AP::scheduler().get_loop_rate_hz();
++    const float gyro_hz = AP::ins().get_gyro_filter_hz();
++    const bool spooled = _motors.get_spool_state() == AP_Motors::SpoolState::THROTTLE_UNLIMITED;
++    static const AC_INDI_Params::Axis bits[3] { AC_INDI_Params::MC_ROLL, AC_INDI_Params::MC_PITCH, AC_INDI_Params::MC_YAW };
++    AC_PID *pids[3] { &get_rate_roll_pid(), &get_rate_pitch_pid(), &get_rate_yaw_pid() };
++    const bool limits[3] { _motors.limit.roll, _motors.limit.pitch, _motors.limit.yaw };
++
++    float out[3];
++    _active = 0;
++    for (uint8_t i = 0; i < 3; i++) {
++        _axis[i].configure(loop_hz, gyro_hz, _indi.filt_hz, _indi.act_tc, _indi.act_dly);
++        const float u_app = applied_input(i);
++        const bool use_indi = spooled && _indi.axis_enabled(bits[i]) && is_positive(_indi.g[i].get());
++        if (use_indi) {
++            const float nu = _indi.k[i] * (ang_vel_body[i] - gyro_rads[i]);
++            out[i] = _axis[i].update(gyro_rads[i], u_app, nu, _indi.g[i]);
++            // keep the PID object consistent: its target is read by the
++            // fixed-wing surfaces slaved to the VTOL rate loop, and a zero
++            // integrator makes a later hand-back to PID bumpless
++            pids[i]->set_target_rate(ang_vel_body[i]);
++            pids[i]->set_actual_rate(gyro_rads[i]);
++            pids[i]->reset_I();
++            _active |= (1U << i);
++        } else {
++            out[i] = pids[i]->update_all(ang_vel_body[i], gyro_rads[i], dt, limits[i], _pd_scale[i], _i_scale[i]);
++            _axis[i].reset(gyro_rads[i], u_app);
++        }
++    }
++
++    _motors.set_roll(out[0] + _actuator_sysid.x);
++    _motors.set_roll_ff((_active & 1U) ? 0.0f : get_rate_roll_pid().get_ff());
++    _motors.set_pitch(out[1] + _actuator_sysid.y);
++    _motors.set_pitch_ff((_active & 2U) ? 0.0f : get_rate_pitch_pid().get_ff());
++    _motors.set_yaw(out[2] + _actuator_sysid.z);
++    _motors.set_yaw_ff((_active & 4U) ? 0.0f : get_rate_yaw_pid().get_ff() * _feedforward_scalar);
++
++    _pd_scale_used = _pd_scale;
++    _i_scale_used = _i_scale;
++    _angle_P_scale_used = _angle_P_scale;
++
++    write_log();
++}
++
++void AC_AttitudeControl_INDI::write_log() const
++{
++#if HAL_LOGGING_ENABLED
++// @LoggerMessage: INDI
++// @Description: VTOL INDI rate loop (normalised mixer units, rad/s/s)
++// @Field: TimeUS: Time since system startup
++// @Field: Act: axes running INDI (1 roll, 2 pitch, 4 yaw)
++// @Field: RNu: roll desired angular acceleration
++// @Field: RWd: roll filtered measured angular acceleration
++// @Field: RU0: roll filtered applied mixer input
++// @Field: RU: roll INDI command
++// @Field: PNu: pitch desired angular acceleration
++// @Field: PWd: pitch filtered measured angular acceleration
++// @Field: PU0: pitch filtered applied mixer input
++// @Field: PU: pitch INDI command
++// @Field: YNu: yaw desired angular acceleration
++// @Field: YWd: yaw filtered measured angular acceleration
++// @Field: YU0: yaw filtered applied mixer input
++// @Field: YU: yaw INDI command
++    AP::logger().WriteStreaming("INDI", "TimeUS,Act,RNu,RWd,RU0,RU,PNu,PWd,PU0,PU,YNu,YWd,YU0,YU",
++                                "s-------------", "F-------------", "QBffffffffffff",
++                                AP_HAL::micros64(), _active,
++                                _axis[0].nu, _axis[0].wdot_f, _axis[0].u0_f, _axis[0].u,
++                                _axis[1].nu, _axis[1].wdot_f, _axis[1].u0_f, _axis[1].u,
++                                _axis[2].nu, _axis[2].wdot_f, _axis[2].u0_f, _axis[2].u);
++#endif
++}
+diff --git a/libraries/AC_AttitudeControl/AC_AttitudeControl_INDI.h b/libraries/AC_AttitudeControl/AC_AttitudeControl_INDI.h
+new file mode 100644
+index 0000000000..e4511afcc6
+--- /dev/null
++++ b/libraries/AC_AttitudeControl/AC_AttitudeControl_INDI.h
+@@ -0,0 +1,39 @@
++#pragma once
++
++/// @file    AC_AttitudeControl_INDI.h
++/// @brief   QuadPlane VTOL attitude control with an INDI body-rate loop
++
++#include "AC_AttitudeControl_TS.h"
++#include "AC_INDI.h"
++
++/*
++  Same as AC_AttitudeControl_TS (angle loop, throttle handling, tailsitter
++  helpers) except for the body-rate loop: axes enabled in Q_INDI_AXES with a
++  non-zero effectiveness use INDI, the others keep the stock PID.
++
++  The effector feedback u0 is what the mixer actually applied last loop,
++  recovered from the motor outputs, so mixer saturation, yaw headroom, slew
++  and the thrust curve are all included.
++ */
++class AC_AttitudeControl_INDI : public AC_AttitudeControl_TS
++{
++public:
++    AC_AttitudeControl_INDI(AP_AHRS_View &ahrs, AP_MotorsMulticopter& motors, const AC_INDI_Params &indi);
++
++    virtual ~AC_AttitudeControl_INDI() {}
++
++    void rate_controller_run_dt(const Vector3f& gyro_rads, float dt) override;
++
++    // bitmask of axes (1 roll, 2 pitch, 4 yaw) that ran INDI in the last loop
++    uint8_t indi_active_mask() const { return _active; }
++
++private:
++    // mixer roll/pitch/yaw input that the motors actually applied last loop
++    float applied_input(uint8_t axis);
++
++    void write_log() const;
++
++    const AC_INDI_Params &_indi;
++    AC_INDI_Axis _axis[3];
++    uint8_t _active;
++};
+diff --git a/libraries/AC_AttitudeControl/AC_INDI.cpp b/libraries/AC_AttitudeControl/AC_INDI.cpp
+new file mode 100644
+index 0000000000..31a4a0cfa2
+--- /dev/null
++++ b/libraries/AC_AttitudeControl/AC_INDI.cpp
+@@ -0,0 +1,192 @@
++#include "AC_INDI.h"
++#include <AP_Math/AP_Math.h>
++
++const AP_Param::GroupInfo AC_INDI_Params::var_info[] = {
++    // @Param: ENABLE
++    // @DisplayName: INDI enable
++    // @Description: Allocate the INDI rate controller at boot. 0 = stock PID rate loop (the INDI code is not run at all).
++    // @Values: 0:Disabled,1:Enabled
++    // @RebootRequired: True
++    // @User: Advanced
++    AP_GROUPINFO_FLAGS("ENABLE", 1, AC_INDI_Params, enable, 0, AP_PARAM_FLAG_ENABLE),
++
++    // @Param: AXES
++    // @DisplayName: INDI axes
++    // @Description: Axes that use INDI. Others use the stock PID.
++    // @Bitmask: 0:VTOL roll,1:VTOL pitch,2:VTOL yaw,3:FW roll,4:FW pitch
++    // @User: Advanced
++    AP_GROUPINFO("AXES", 2, AC_INDI_Params, axes, 27),
++
++    // @Param: FILT_HZ
++    // @DisplayName: INDI filter frequency
++    // @Description: Frequency of the two poles of the low-pass on angular acceleration and on the effector feedback
++    // @Units: Hz
++    // @Range: 3 50
++    // @User: Advanced
++    AP_GROUPINFO("FILT_HZ", 3, AC_INDI_Params, filt_hz, 12.7),
++
++    // @Param: RLL_K
++    // @DisplayName: INDI VTOL roll rate gain
++    // @Description: Desired roll acceleration per unit roll rate error
++    // @Units: 1/s
++    // @User: Advanced
++    AP_GROUPINFO("RLL_K", 4, AC_INDI_Params, k[0], 10),
++
++    // @Param: PIT_K
++    // @DisplayName: INDI VTOL pitch rate gain
++    // @Units: 1/s
++    // @User: Advanced
++    AP_GROUPINFO("PIT_K", 5, AC_INDI_Params, k[1], 10),
++
++    // @Param: YAW_K
++    // @DisplayName: INDI VTOL yaw rate gain
++    // @Units: 1/s
++    // @User: Advanced
++    AP_GROUPINFO("YAW_K", 6, AC_INDI_Params, k[2], 4),
++
++    // @Param: RLL_G
++    // @DisplayName: INDI VTOL roll effectiveness
++    // @Description: Roll acceleration per unit mixer roll input. 0 keeps this axis on PID.
++    // @Units: rad/s/s
++    // @User: Advanced
++    AP_GROUPINFO("RLL_G", 7, AC_INDI_Params, g[0], 0),
++
++    // @Param: PIT_G
++    // @DisplayName: INDI VTOL pitch effectiveness
++    // @Units: rad/s/s
++    // @User: Advanced
++    AP_GROUPINFO("PIT_G", 8, AC_INDI_Params, g[1], 0),
++
++    // @Param: YAW_G
++    // @DisplayName: INDI VTOL yaw effectiveness
++    // @Units: rad/s/s
++    // @User: Advanced
++    AP_GROUPINFO("YAW_G", 9, AC_INDI_Params, g[2], 0),
++
++    // @Param: ACT_TC
++    // @DisplayName: INDI lift motor time constant
++    // @Units: s
++    // @User: Advanced
++    AP_GROUPINFO("ACT_TC", 10, AC_INDI_Params, act_tc, 0.03),
++
++    // @Param: ACT_DLY
++    // @DisplayName: INDI lift motor delay
++    // @Units: s
++    // @User: Advanced
++    AP_GROUPINFO("ACT_DLY", 11, AC_INDI_Params, act_dly, 0),
++
++    // @Param: FW_RLL_G
++    // @DisplayName: INDI aileron effectiveness
++    // @Description: Roll acceleration per unit aileron (full travel) at speed scaler 1 (airspeed = SCALING_SPEED). Scaled by 1/scaler^2. 0 keeps this axis on PID.
++    // @Units: rad/s/s
++    // @User: Advanced
++    AP_GROUPINFO("FW_RLL_G", 12, AC_INDI_Params, fw_g[0], 0),
++
++    // @Param: FW_PIT_G
++    // @DisplayName: INDI elevator effectiveness
++    // @Units: rad/s/s
++    // @User: Advanced
++    AP_GROUPINFO("FW_PIT_G", 13, AC_INDI_Params, fw_g[1], 0),
++
++    // @Param: FW_TC
++    // @DisplayName: INDI surface time constant
++    // @Units: s
++    // @User: Advanced
++    AP_GROUPINFO("FW_TC", 14, AC_INDI_Params, fw_tc, 0.02),
++
++    // @Param: FW_RLL_K
++    // @DisplayName: INDI FW roll rate gain
++    // @Units: 1/s
++    // @User: Advanced
++    AP_GROUPINFO("FW_RLL_K", 15, AC_INDI_Params, fw_k[0], 8),
++
++    // @Param: FW_PIT_K
++    // @DisplayName: INDI FW pitch rate gain
++    // @Units: 1/s
++    // @User: Advanced
++    AP_GROUPINFO("FW_PIT_K", 16, AC_INDI_Params, fw_k[1], 8),
++
++    AP_GROUPEND
++};
++
++AC_INDI_Params::AC_INDI_Params()
++{
++    AP_Param::setup_object_defaults(this, var_info);
++}
++
++void AC_INDI_Axis::configure(float loop_hz, float gyro_filt_hz, float filt_hz, float act_tc, float act_dly)
++{
++    if (is_equal(loop_hz, _loop_hz) && is_equal(gyro_filt_hz, _gyro_hz) &&
++        is_equal(filt_hz, _filt_hz) && is_equal(act_tc, _tc) && is_equal(act_dly, _dly)) {
++        return;
++    }
++    _loop_hz = MAX(loop_hz, 50.0f);
++    _gyro_hz = gyro_filt_hz;
++    _filt_hz = MAX(filt_hz, 1.0f);
++    _tc = MAX(act_tc, 0.0f);
++    _dly = MAX(act_dly, 0.0f);
++    _dt = 1.0f / _loop_hz;
++
++    _a_act = _dt / (_dt + _tc);
++    const float rc = 1.0f / (M_2PI * _filt_hz);
++    _a_h = _dt / (_dt + rc);
++    _n_dly = MIN(uint8_t(lrintf(_dly * _loop_hz)), uint8_t(DELAY_MAX - 1));
++    _gyro_sync.set_cutoff_frequency(_loop_hz, _gyro_hz);
++    _seeded = false;
++}
++
++float AC_INDI_Axis::step_actuator(float u_applied)
++{
++    // pure delay (ring buffer), then first-order lag
++    _dly_buf[_dly_idx] = u_applied;
++    const uint8_t out_idx = (_dly_idx + DELAY_MAX - _n_dly) % DELAY_MAX;
++    const float delayed = _dly_buf[out_idx];
++    _dly_idx = (_dly_idx + 1) % DELAY_MAX;
++    _u_act += _a_act * (delayed - _u_act);
++    return _u_act;
++}
++
++void AC_INDI_Axis::reset(float rate, float u_applied)
++{
++    for (float &b : _dly_buf) {
++        b = u_applied;
++    }
++    _u_act = u_applied;
++    _u_prev = u_applied;
++    _gyro_sync.reset(u_applied);
++    _hu1 = _hu2 = u_applied;
++    _rate_prev = rate;
++    _hw1 = _hw2 = 0.0f;
++    nu = wdot_f = 0.0f;
++    u0_f = u = u_applied;
++    _seeded = true;
++}
++
++float AC_INDI_Axis::update(float rate, float u_applied, float nu_in, float G)
++{
++    if (!_seeded) {
++        reset(rate, u_applied);
++    }
++
++    // measured angular acceleration: backward difference, then H
++    const float wdot_raw = (rate - _rate_prev) * _loop_hz;
++    _rate_prev = rate;
++    _hw1 += _a_h * (wdot_raw - _hw1);
++    _hw2 += _a_h * (_hw1 - _hw2);
++
++    // effector feedback through the same chain: actuator model, the half
++    // sample of the backward difference, the INS gyro filter, then H
++    const float ua = step_actuator(u_applied);
++    const float uh = 0.5f * (ua + _u_prev);
++    _u_prev = ua;
++    const float ug = is_positive(_gyro_hz) ? _gyro_sync.apply(uh) : uh;
++    _hu1 += _a_h * (ug - _hu1);
++    _hu2 += _a_h * (_hu1 - _hu2);
++
++    nu = nu_in;
++    wdot_f = _hw2;
++    u0_f = _hu2;
++    const float G_safe = MAX(G, 1.0f);
++    u = constrain_float(u0_f + (nu - wdot_f) / G_safe, -1.0f, 1.0f);
++    return u;
++}
+diff --git a/libraries/AC_AttitudeControl/AC_INDI.h b/libraries/AC_AttitudeControl/AC_INDI.h
+new file mode 100644
+index 0000000000..f0fcd5e0c6
+--- /dev/null
++++ b/libraries/AC_AttitudeControl/AC_INDI.h
+@@ -0,0 +1,90 @@
++#pragma once
++
++/*
++  Incremental Nonlinear Dynamic Inversion (INDI) for the body-rate loop.
++
++  One AC_INDI_Axis per controlled axis. Each cycle:
++
++      nu      = K * (rate_target - rate)                 desired angular accel
++      wdot_f  = H( d/dt rate )                           measured angular accel
++      u0_f    = H( F_gyro( A( u_applied ) ) )            effector state, synchronised
++      u       = u0_f + (nu - wdot_f) / G                 new effector command
++
++  rate      gyro rate the caller already uses (INS low-pass applied, F_gyro)
++  A(s)      actuator model  exp(-s T) / (1 + s tau)
++  F_gyro    copy of the INS gyro low-pass, so u0 sees the same lag as the gyro
++  H(s)      second order low-pass, two equal real poles at FILT_HZ
++  G         effectiveness, rad/s^2 per unit normalised command
++
++  The u0 path gets every filter and delay the angular-acceleration path has
++  (including the half sample of the backward difference), so the two signals
++  line up in time. Without that the loop limit-cycles.
++ */
++
++#include <AP_Common/AP_Common.h>
++#include <AP_Param/AP_Param.h>
++#include <Filter/LowPassFilter2p.h>
++
++class AC_INDI_Params {
++public:
++    AC_INDI_Params();
++    CLASS_NO_COPY(AC_INDI_Params);
++
++    enum Axis : uint8_t {
++        MC_ROLL  = 1U << 0,
++        MC_PITCH = 1U << 1,
++        MC_YAW   = 1U << 2,
++        FW_ROLL  = 1U << 3,
++        FW_PITCH = 1U << 4,
++    };
++    bool axis_enabled(Axis a) const { return enable > 0 && (uint8_t(axes.get()) & a) != 0; }
++
++    AP_Int8  enable;
++    AP_Int8  axes;
++    AP_Float filt_hz;
++    AP_Float k[3];          // rate error gain, 1/s (roll, pitch, yaw)
++    AP_Float g[3];          // rotor effectiveness, rad/s^2 per unit mixer input
++    AP_Float act_tc;        // rotor actuator time constant, s
++    AP_Float act_dly;       // rotor actuator delay, s
++    AP_Float fw_g[2];       // surface effectiveness at speed scaler 1 (roll, pitch)
++    AP_Float fw_tc;         // surface actuator time constant, s
++    AP_Float fw_k[2];       // surface rate error gain, 1/s
++
++    static const struct AP_Param::GroupInfo var_info[];
++};
++
++class AC_INDI_Axis {
++public:
++    // (re)configure filters; cheap to call every loop, only acts on a change
++    void configure(float loop_hz, float gyro_filt_hz, float filt_hz, float act_tc, float act_dly);
++
++    // one INDI step; returns the new normalised effector command
++    float update(float rate, float u_applied, float nu, float G);
++
++    // seed all states so a later switch to INDI is bumpless
++    void reset(float rate, float u_applied);
++
++    // last values, for logging
++    float nu = 0, wdot_f = 0, u0_f = 0, u = 0;
++
++private:
++    static constexpr uint8_t DELAY_MAX = 16;
++
++    float step_actuator(float u_applied);
++
++    float _loop_hz = -1, _gyro_hz = -1, _filt_hz = -1, _tc = -1, _dly = -1;
++    float _dt = 0.0025f;
++    float _a_act = 1;       // first-order actuator coefficient
++    float _a_h = 1;         // first-order coefficient of each H pole
++    uint8_t _n_dly = 0;
++    float _dly_buf[DELAY_MAX] {};
++    uint8_t _dly_idx = 0;
++
++    float _u_act = 0;       // actuator model state
++    float _u_prev = 0;      // for the half-sample of the backward difference
++    LowPassFilter2pFloat _gyro_sync;
++    float _hu1 = 0, _hu2 = 0;   // H on u0
++    float _rate_prev = 0;
++    float _hw1 = 0, _hw2 = 0;   // H on d/dt rate
++    bool _seeded = false;
++};
+diff --git a/libraries/APM_Control/AP_FW_Controller.cpp b/libraries/APM_Control/AP_FW_Controller.cpp
+index 6b5f396891..65c5973df3 100644
+--- a/libraries/APM_Control/AP_FW_Controller.cpp
++++ b/libraries/APM_Control/AP_FW_Controller.cpp
+@@ -20,6 +20,7 @@
+ #include "AP_FW_Controller.h"
+ #include <AP_AHRS/AP_AHRS.h>
+ #include <AP_Scheduler/AP_Scheduler.h>
++#include <AP_InertialSensor/AP_InertialSensor.h>
+ #include <GCS_MAVLink/GCS.h>
+ #include <AP_Math/AP_Math.h>
+ 
+@@ -150,6 +151,27 @@ float AP_FW_Controller::run_rate_control(float desired_rate_degs, float scaler,
+     const float eas2tas = AP::ahrs().get_EAS2TAS();
+     bool limit_I = fabsf(_last_out) >= 45;
+     const float rate_rads = get_measured_rate_rads();
++
++    if (_indi_params != nullptr) {
++        _indi.configure(AP::scheduler().get_loop_rate_hz(), AP::ins().get_gyro_filter_hz(),
++                        _indi_params->filt_hz, _indi_params->fw_tc, 0.0f);
++    }
++    if (_indi_allowed && _indi_params != nullptr && !ground_mode && is_positive(scaler) &&
++        is_positive(_indi_params->fw_g[_indi_axis].get())) {
++        // INDI: effectiveness scales with dynamic pressure, i.e. 1/scaler^2
++        _indi_G = _indi_params->fw_g[_indi_axis] / sq(scaler);
++        const float nu = _indi_params->fw_k[_indi_axis] * (radians(desired_rate_degs) - rate_rads);
++        const float u = _indi.update(rate_rads, _last_u, nu, _indi_G);
++        _indi_active = true;
++        _last_u = u;
++        _last_out = u * 45;
++        rate_pid.reset_I();
++        _pid_info = AP_PIDInfo{};
++        _pid_info.target = desired_rate_degs;
++        _pid_info.actual = degrees(rate_rads);
++        return u * 4500;
++    }
++    _indi_active = false;
+     const float old_I = rate_pid.get_i();
+ 
+     const bool underspeed = is_underspeed();
+@@ -211,7 +233,13 @@ float AP_FW_Controller::run_rate_control(float desired_rate_degs, float scaler,
+     }
+ 
+     // output is scaled to notional centidegrees of deflection
+-    return constrain_float(out * 100, -4500, 4500);
++    const float out_cd = constrain_float(out * 100, -4500, 4500);
++
++    // keep the INDI states following the PID so a switch to INDI is bumpless
++    _last_u = out_cd / 4500;
++    _indi.reset(rate_rads, _last_u);
++
++    return out_cd;
+ }
+ 
+ /*
+@@ -324,6 +352,8 @@ void AP_FW_Controller::reset()
+     rate_pid.reset_I();
+     rate_pid.reset_filter();
+     _last_out = 0.0;
++    _last_u = 0.0;
++    _indi.reset(get_measured_rate_rads(), 0.0f);
+ 
+     // Reset input shaping
+     reset_input_shaping_deg(get_measured_angle_deg(), degrees(get_measured_rate_rads()));
+diff --git a/libraries/APM_Control/AP_FW_Controller.h b/libraries/APM_Control/AP_FW_Controller.h
+index b79685cd66..4aecd0a9af 100644
+--- a/libraries/APM_Control/AP_FW_Controller.h
++++ b/libraries/APM_Control/AP_FW_Controller.h
+@@ -3,6 +3,7 @@
+ #include <AP_Common/AP_Common.h>
+ #include "AP_AutoTune.h"
+ #include <AC_PID/AC_PID.h>
++#include <AC_AttitudeControl/AC_INDI.h>
+ 
+ class AP_FW_Controller
+ {
+@@ -62,6 +63,16 @@ public:
+     // Get angle P gain
+     float get_angle_p() const;
+ 
++    // INDI surface rate loop. The vehicle calls this every loop to say whether
++    // INDI may own this axis now (axis: 0 roll, 1 pitch); it runs only when
++    // allowed and the axis effectiveness is set, otherwise the stock PID runs.
++    void set_indi(const AC_INDI_Params *params, uint8_t axis, bool allowed) {
++        _indi_params = params; _indi_axis = axis; _indi_allowed = allowed;
++    }
++    bool indi_active() const { return _indi_active; }
++    float indi_G() const { return _indi_G; }
++    const AC_INDI_Axis &indi_axis() const { return _indi; }
++
+ protected:
+     const AP_FixedWing &aparm;
+     AP_AutoTune::ATGains gains;
+@@ -122,6 +133,15 @@ protected:
+ 
+     const AP_AutoTune::ATType autotune_type;
+ 
++    // INDI state
++    const AC_INDI_Params *_indi_params = nullptr;
++    uint8_t _indi_axis = 0;
++    bool _indi_allowed = false;
++    bool _indi_active = false;
++    float _indi_G = 0.0f;
++    float _last_u = 0.0f;   // last surface command, normalised to full travel
++    AC_INDI_Axis _indi;
++
+ private:
+ 
+ #if CONFIG_HAL_BOARD == HAL_BOARD_SITL
+-- 
+2.43.0
+

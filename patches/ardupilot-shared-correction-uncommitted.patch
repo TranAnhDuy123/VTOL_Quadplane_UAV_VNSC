@@ -1,0 +1,335 @@
+diff --git a/ArduPlane/Attitude.cpp b/ArduPlane/Attitude.cpp
+index 2514d93897..cf8463b9cb 100644
+--- a/ArduPlane/Attitude.cpp
++++ b/ArduPlane/Attitude.cpp
+@@ -443,15 +443,25 @@ void Plane::stabilize()
+     last_stabilize_ms = now;
+ 
+ #if HAL_QUADPLANE_ENABLED
+-    // INDI on the control surfaces only in fixed-wing flight proper: transition
+-    // complete, no VTOL assist and not a VTOL mode. In VTOL modes and
+-    // transitions the lift motors run INDI and the surfaces keep the stock PID,
+-    // so only one INDI loop ever acts on an axis.
+-    const bool fw_indi = quadplane.available() && quadplane.indi.enable > 0 &&
+-                         !quadplane.in_vtol_mode() && quadplane.transition->complete() &&
+-                         !quadplane.in_assisted_flight();
+-    rollController.set_indi(&quadplane.indi, 0, fw_indi && quadplane.indi.axis_enabled(AC_INDI_Params::FW_ROLL));
+-    pitchController.set_indi(&quadplane.indi, 1, fw_indi && quadplane.indi.axis_enabled(AC_INDI_Params::FW_PITCH));
++    // INDI on the control surfaces in every phase in which they are driven by
++    // a rate loop: hover modes (slaved to the VTOL rate target), transition,
++    // assisted and wing-borne flight. When the lift motors also run INDI the
++    // two sets share each correction (AC_INDI.h). Surface effectiveness scales
++    // with dynamic pressure, G = FW_G * (V / SCALING_SPEED)^2, and is 0 below
++    // half of AIRSPEED_MIN, where ArduPilot itself treats the surfaces as
++    // ineffective in VTOL flight; there the stock PID runs.
++    float fw_g_scale = 0.0f;
++    if (quadplane.available() && quadplane.indi.enable > 0 && is_positive(g.scaling_speed)) {
++        float aspeed;
++        const float v_on = 0.5f * MAX(aparm.airspeed_min, MIN_AIRSPEED_MIN);
++        if (ahrs.airspeed_EAS(aspeed) && aspeed > v_on) {
++            fw_g_scale = sq(aspeed / g.scaling_speed);
++        }
++    }
++    rollController.set_indi(&quadplane.indi, 0, quadplane.indi.axis_enabled(AC_INDI_Params::FW_ROLL) ?
++                            quadplane.indi.fw_g[0] * fw_g_scale : 0.0f);
++    pitchController.set_indi(&quadplane.indi, 1, quadplane.indi.axis_enabled(AC_INDI_Params::FW_PITCH) ?
++                             quadplane.indi.fw_g[1] * fw_g_scale : 0.0f);
+ #endif
+ 
+     if (control_mode == &mode_training ||
+@@ -501,13 +511,16 @@ void Plane::stabilize()
+ // @Field: PU: pitch INDI elevator command
+ // @Field: PG: pitch effectiveness used
+ // @Field: Scl: speed scaler
+-        AP::logger().WriteStreaming("INDF", "TimeUS,Act,RNu,RWd,RU0,RU,RG,PNu,PWd,PU0,PU,PG,Scl",
+-                                    "s------------", "F------------", "QBfffffffffff",
++// @Field: RS: roll allocation denominator, sum of G^2 over surfaces and motors
++// @Field: PS: pitch allocation denominator
++        AP::logger().WriteStreaming("INDF", "TimeUS,Act,RNu,RWd,RU0,RU,RG,PNu,PWd,PU0,PU,PG,Scl,RS,PS",
++                                    "s--------------", "F--------------", "QBfffffffffffff",
+                                     AP_HAL::micros64(),
+                                     uint8_t((rollController.indi_active() ? 1U : 0U) | (pitchController.indi_active() ? 2U : 0U)),
+                                     r.nu, r.wdot_f, r.u0_f, r.u, rollController.indi_G(),
+                                     p.nu, p.wdot_f, p.u0_f, p.u, pitchController.indi_G(),
+-                                    get_speed_scaler());
++                                    get_speed_scaler(),
++                                    rollController.indi_G_sumsq(), pitchController.indi_G_sumsq());
+     }
+ #endif
+ 
+diff --git a/libraries/AC_AttitudeControl/AC_AttitudeControl_INDI.cpp b/libraries/AC_AttitudeControl/AC_AttitudeControl_INDI.cpp
+index bd75eef040..2a140928de 100644
+--- a/libraries/AC_AttitudeControl/AC_AttitudeControl_INDI.cpp
++++ b/libraries/AC_AttitudeControl/AC_AttitudeControl_INDI.cpp
+@@ -66,7 +66,13 @@ void AC_AttitudeControl_INDI::rate_controller_run_dt(const Vector3f& gyro_rads,
+         const bool use_indi = spooled && _indi.axis_enabled(bits[i]) && is_positive(_indi.g[i].get());
+         if (use_indi) {
+             const float nu = _indi.k[i] * (ang_vel_body[i] - gyro_rads[i]);
+-            out[i] = _axis[i].update(gyro_rads[i], u_app, nu, _indi.g[i], dt);
++            // share the correction with the control surfaces if they ran INDI
++            // on this axis in the last few cycles (roll and pitch only)
++            const float G = _indi.g[i];
++            const float G_sumsq = sq(G) + _indi.share.other_sq(AC_INDI_Share::MOTORS, i);
++            _G_sumsq[i] = G_sumsq;
++            out[i] = _axis[i].update(gyro_rads[i], u_app, nu, G, dt, G_sumsq);
++            _indi.share.report(AC_INDI_Share::MOTORS, i, G);
+             // keep the PID object consistent: its target is read by the
+             // fixed-wing surfaces slaved to the VTOL rate loop, and a zero
+             // integrator makes a later hand-back to PID bumpless
+@@ -77,6 +83,8 @@ void AC_AttitudeControl_INDI::rate_controller_run_dt(const Vector3f& gyro_rads,
+         } else {
+             out[i] = pids[i]->update_all(ang_vel_body[i], gyro_rads[i], dt, limits[i], _pd_scale[i], _i_scale[i]);
+             _axis[i].reset(gyro_rads[i], u_app);
++            _indi.share.report(AC_INDI_Share::MOTORS, i, 0.0f);
++            _G_sumsq[i] = 0.0f;
+         }
+     }
+ 
+@@ -113,11 +121,14 @@ void AC_AttitudeControl_INDI::write_log() const
+ // @Field: YWd: yaw filtered measured angular acceleration
+ // @Field: YU0: yaw filtered applied mixer input
+ // @Field: YU: yaw INDI command
+-    AP::logger().WriteStreaming("INDI", "TimeUS,Act,RNu,RWd,RU0,RU,PNu,PWd,PU0,PU,YNu,YWd,YU0,YU",
+-                                "s-------------", "F-------------", "QBffffffffffff",
++// @Field: RS: roll allocation denominator, sum of G^2 over motors and surfaces
++// @Field: PS: pitch allocation denominator
++    AP::logger().WriteStreaming("INDI", "TimeUS,Act,RNu,RWd,RU0,RU,PNu,PWd,PU0,PU,YNu,YWd,YU0,YU,RS,PS",
++                                "s---------------", "F---------------", "QBffffffffffffff",
+                                 AP_HAL::micros64(), _active,
+                                 _axis[0].nu, _axis[0].wdot_f, _axis[0].u0_f, _axis[0].u,
+                                 _axis[1].nu, _axis[1].wdot_f, _axis[1].u0_f, _axis[1].u,
+-                                _axis[2].nu, _axis[2].wdot_f, _axis[2].u0_f, _axis[2].u);
++                                _axis[2].nu, _axis[2].wdot_f, _axis[2].u0_f, _axis[2].u,
++                                _G_sumsq[0], _G_sumsq[1]);
+ #endif
+ }
+diff --git a/libraries/AC_AttitudeControl/AC_AttitudeControl_INDI.h b/libraries/AC_AttitudeControl/AC_AttitudeControl_INDI.h
+index e4511afcc6..5ada35b581 100644
+--- a/libraries/AC_AttitudeControl/AC_AttitudeControl_INDI.h
++++ b/libraries/AC_AttitudeControl/AC_AttitudeControl_INDI.h
+@@ -11,7 +11,9 @@
+   helpers) except for the body-rate loop: axes enabled in Q_INDI_AXES with a
+   non-zero effectiveness use INDI, the others keep the stock PID.
+ 
+-  The effector feedback u0 is what the mixer actually applied last loop,
++  Roll and pitch share each correction with the control surfaces whenever
++  they also run INDI (see AC_INDI.h). The effector feedback u0 is what the
++  mixer actually applied last loop,
+   recovered from the motor outputs, so mixer saturation, yaw headroom, slew
+   and the thrust curve are all included.
+  */
+@@ -36,4 +38,5 @@ private:
+     const AC_INDI_Params &_indi;
+     AC_INDI_Axis _axis[3];
+     uint8_t _active;
++    float _G_sumsq[3] {};   // allocation denominator used last loop, for logging
+ };
+diff --git a/libraries/AC_AttitudeControl/AC_INDI.cpp b/libraries/AC_AttitudeControl/AC_INDI.cpp
+index 9ef8811337..3189373e27 100644
+--- a/libraries/AC_AttitudeControl/AC_INDI.cpp
++++ b/libraries/AC_AttitudeControl/AC_INDI.cpp
+@@ -1,4 +1,5 @@
+ #include "AC_INDI.h"
++#include <AP_HAL/AP_HAL.h>
+ #include <AP_Math/AP_Math.h>
+ 
+ const AP_Param::GroupInfo AC_INDI_Params::var_info[] = {
+@@ -77,7 +78,7 @@ const AP_Param::GroupInfo AC_INDI_Params::var_info[] = {
+ 
+     // @Param: FW_RLL_G
+     // @DisplayName: INDI aileron effectiveness
+-    // @Description: Roll acceleration per unit aileron (full travel) at speed scaler 1 (airspeed = SCALING_SPEED). Scaled by 1/scaler^2. 0 keeps this axis on PID.
++    // @Description: Roll acceleration per unit aileron (full travel) at airspeed = SCALING_SPEED. Scaled by (airspeed/SCALING_SPEED)^2 and shared with the lift motors when both run INDI. 0 keeps this axis on PID.
+     // @Units: rad/s/s
+     // @User: Advanced
+     AP_GROUPINFO("FW_RLL_G", 12, AC_INDI_Params, fw_g[0], 0),
+@@ -114,6 +115,27 @@ AC_INDI_Params::AC_INDI_Params()
+     AP_Param::setup_object_defaults(this, var_info);
+ }
+ 
++void AC_INDI_Share::report(Effector e, uint8_t axis, float G)
++{
++    if (axis > 1) {
++        return;
++    }
++    _g[e][axis] = MAX(G, 0.0f);
++    _us[e][axis] = AP_HAL::micros();
++}
++
++float AC_INDI_Share::other_sq(Effector e, uint8_t axis) const
++{
++    if (axis > 1) {
++        return 0.0f;
++    }
++    const uint8_t o = (e == MOTORS) ? SURFACES : MOTORS;
++    if (_us[o][axis] == 0 || AP_HAL::micros() - _us[o][axis] > STALE_US) {
++        return 0.0f;
++    }
++    return sq(_g[o][axis]);
++}
++
+ void AC_INDI_Axis::configure(float gyro_filt_hz, float filt_hz, float act_tc, float act_dly)
+ {
+     if (is_equal(gyro_filt_hz, _gyro_hz) && is_equal(filt_hz, _filt_hz) &&
+@@ -171,7 +193,7 @@ void AC_INDI_Axis::reset(float rate, float u_applied)
+     _seeded = true;
+ }
+ 
+-float AC_INDI_Axis::update(float rate, float u_applied, float nu_in, float G, float dt)
++float AC_INDI_Axis::update(float rate, float u_applied, float nu_in, float G, float dt, float G_sumsq)
+ {
+     // smoothed loop period; filters are recomputed only on a real change
+     if (dt > 0.0005f && dt < 0.05f) {
+@@ -207,7 +229,10 @@ float AC_INDI_Axis::update(float rate, float u_applied, float nu_in, float G, fl
+     nu = nu_in;
+     wdot_f = _hw2;
+     u0_f = _hu2;
++    // minimum-norm share of the correction; with one effector set den = G^2
++    // and this is the plain inverse (nu - wdot_f) / G
+     const float G_safe = MAX(G, 1.0f);
+-    u = constrain_float(u0_f + (nu - wdot_f) / G_safe, -1.0f, 1.0f);
++    const float den = MAX(G_sumsq, sq(G_safe));
++    u = constrain_float(u0_f + G_safe * (nu - wdot_f) / den, -1.0f, 1.0f);
+     return u;
+ }
+diff --git a/libraries/AC_AttitudeControl/AC_INDI.h b/libraries/AC_AttitudeControl/AC_INDI.h
+index da70a741b7..feaede5e23 100644
+--- a/libraries/AC_AttitudeControl/AC_INDI.h
++++ b/libraries/AC_AttitudeControl/AC_INDI.h
+@@ -19,12 +19,39 @@
+   The u0 path gets every filter and delay the angular-acceleration path has
+   (including the half sample of the backward difference), so the two signals
+   line up in time. Without that the loop limit-cycles.
++
++  Lift motors and control surfaces act on the same roll/pitch axis during
++  hover, transition and assisted flight. Each set runs its own AC_INDI_Axis,
++  but the correction is allocated between them (minimum-norm split):
++
++      u_i = u0_f,i + G_i (nu - wdot_f) / (G_motor^2 + G_surface^2)
++
++  so the moments add up to nu - wdot_f once, not once per effector set.
++  Each loop reports the G it used through AC_INDI_Share; a loop that did not
++  run INDI this cycle reports 0 or goes stale, and drops out of the sum.
+  */
+ 
+ #include <AP_Common/AP_Common.h>
+ #include <AP_Param/AP_Param.h>
+ #include <Filter/LowPassFilter2p.h>
+ 
++// Effectiveness each effector set used in its last INDI step, per roll/pitch
++// axis, so the other set can include it in the allocation denominator.
++class AC_INDI_Share {
++public:
++    enum Effector : uint8_t { MOTORS = 0, SURFACES = 1 };
++
++    void report(Effector e, uint8_t axis, float G);
++
++    // G^2 of the other effector set on this axis, 0 if it did not run INDI recently
++    float other_sq(Effector e, uint8_t axis) const;
++
++private:
++    static constexpr uint32_t STALE_US = 10000;
++    float _g[2][2] {};
++    uint32_t _us[2][2] {};
++};
++
+ class AC_INDI_Params {
+ public:
+     AC_INDI_Params();
+@@ -50,6 +77,9 @@ public:
+     AP_Float fw_tc;         // surface actuator time constant, s
+     AP_Float fw_k[2];       // surface rate error gain, 1/s
+ 
++    // run-time allocation state shared by the motor and surface loops
++    mutable AC_INDI_Share share;
++
+     static const struct AP_Param::GroupInfo var_info[];
+ };
+ 
+@@ -63,7 +93,9 @@ public:
+     // nominal SCHED_LOOP_RATE (JSON SITL steps in whole milliseconds, so a
+     // 400 Hz loop actually runs every 3 ms), and both the derivative and the
+     // filter corners must use the real sample period.
+-    float update(float rate, float u_applied, float nu, float G, float dt);
++    // G_sumsq is the allocation denominator (sum of G^2 over every effector
++    // set running INDI on this axis); values below G^2 mean "this set alone".
++    float update(float rate, float u_applied, float nu, float G, float dt, float G_sumsq = 0.0f);
+ 
+     // seed all states so a later switch to INDI is bumpless
+     void reset(float rate, float u_applied);
+diff --git a/libraries/APM_Control/AP_FW_Controller.cpp b/libraries/APM_Control/AP_FW_Controller.cpp
+index be13b37206..b7eaa9006d 100644
+--- a/libraries/APM_Control/AP_FW_Controller.cpp
++++ b/libraries/APM_Control/AP_FW_Controller.cpp
+@@ -155,12 +155,16 @@ float AP_FW_Controller::run_rate_control(float desired_rate_degs, float scaler,
+     if (_indi_params != nullptr) {
+         _indi.configure(AP::ins().get_gyro_filter_hz(), _indi_params->filt_hz, _indi_params->fw_tc, 0.0f);
+     }
+-    if (_indi_allowed && _indi_params != nullptr && !ground_mode && is_positive(scaler) &&
+-        is_positive(_indi_params->fw_g[_indi_axis].get())) {
+-        // INDI: effectiveness scales with dynamic pressure, i.e. 1/scaler^2
+-        _indi_G = _indi_params->fw_g[_indi_axis] / sq(scaler);
++    if (_indi_params != nullptr && !ground_mode && is_positive(_indi_G_in)) {
++        // INDI. _indi_G_in is set by the vehicle from airspeed (dynamic
++        // pressure); the correction is shared with the lift motors when they
++        // also ran INDI on this axis in the last few cycles
++        _indi_G = _indi_G_in;
++        const float G_sumsq = sq(_indi_G) + _indi_params->share.other_sq(AC_INDI_Share::SURFACES, _indi_axis);
++        _indi_G_sumsq = G_sumsq;
+         const float nu = _indi_params->fw_k[_indi_axis] * (radians(desired_rate_degs) - rate_rads);
+-        const float u = _indi.update(rate_rads, _last_u, nu, _indi_G, AP::scheduler().get_last_loop_time_s());
++        const float u = _indi.update(rate_rads, _last_u, nu, _indi_G, AP::scheduler().get_last_loop_time_s(), G_sumsq);
++        _indi_params->share.report(AC_INDI_Share::SURFACES, _indi_axis, _indi_G);
+         _indi_active = true;
+         _last_u = u;
+         _last_out = u * 45;
+@@ -171,6 +175,11 @@ float AP_FW_Controller::run_rate_control(float desired_rate_degs, float scaler,
+         return u * 4500;
+     }
+     _indi_active = false;
++    _indi_G = 0.0f;
++    _indi_G_sumsq = 0.0f;
++    if (_indi_params != nullptr) {
++        _indi_params->share.report(AC_INDI_Share::SURFACES, _indi_axis, 0.0f);
++    }
+     const float old_I = rate_pid.get_i();
+ 
+     const bool underspeed = is_underspeed();
+diff --git a/libraries/APM_Control/AP_FW_Controller.h b/libraries/APM_Control/AP_FW_Controller.h
+index 4aecd0a9af..9705037501 100644
+--- a/libraries/APM_Control/AP_FW_Controller.h
++++ b/libraries/APM_Control/AP_FW_Controller.h
+@@ -63,14 +63,15 @@ public:
+     // Get angle P gain
+     float get_angle_p() const;
+ 
+-    // INDI surface rate loop. The vehicle calls this every loop to say whether
+-    // INDI may own this axis now (axis: 0 roll, 1 pitch); it runs only when
+-    // allowed and the axis effectiveness is set, otherwise the stock PID runs.
+-    void set_indi(const AC_INDI_Params *params, uint8_t axis, bool allowed) {
+-        _indi_params = params; _indi_axis = axis; _indi_allowed = allowed;
++    // INDI surface rate loop. The vehicle calls this every loop with the
++    // current surface effectiveness G (rad/s^2 per unit surface travel,
++    // axis: 0 roll, 1 pitch). G > 0 runs INDI; G = 0 runs the stock PID.
++    void set_indi(const AC_INDI_Params *params, uint8_t axis, float G) {
++        _indi_params = params; _indi_axis = axis; _indi_G_in = G;
+     }
+     bool indi_active() const { return _indi_active; }
+     float indi_G() const { return _indi_G; }
++    float indi_G_sumsq() const { return _indi_G_sumsq; }
+     const AC_INDI_Axis &indi_axis() const { return _indi; }
+ 
+ protected:
+@@ -136,9 +137,10 @@ protected:
+     // INDI state
+     const AC_INDI_Params *_indi_params = nullptr;
+     uint8_t _indi_axis = 0;
+-    bool _indi_allowed = false;
++    float _indi_G_in = 0.0f;     // effectiveness offered by the vehicle this loop
+     bool _indi_active = false;
+-    float _indi_G = 0.0f;
++    float _indi_G = 0.0f;        // effectiveness used in the last INDI step
++    float _indi_G_sumsq = 0.0f;  // allocation denominator used in the last INDI step
+     float _last_u = 0.0f;   // last surface command, normalised to full travel
+     AC_INDI_Axis _indi;
+ 

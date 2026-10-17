@@ -1,0 +1,30 @@
+# INDI overlay: appended to sim/stock_pid.param for the INDI runs (later lines win).
+# The PID and INDI runs therefore differ only in these Q_INDI_* lines.
+#
+# G, tau, T: analysis/identify_G.py --fit-fmin 3 on runs/sysid_hover (hover) and
+#            runs/sysid_fw (fixed wing): stock SystemID chirps on the mixer input,
+#            instrumental estimate S_r,wdot / S_r,u, bins above 3 Hz.
+# K:         analysis/indi_margins.py --fs 333 : largest K with GM >= 6 dB and
+#            PM >= 45 deg is 14 (VTOL) and 11 (FW); a little below is used.
+#            (the JSON SITL loop runs every 3 ms, i.e. at 333 Hz)
+# FILT_HZ:   80 rad/s (12.7 Hz), two equal poles, as in Lombaerts et al. 2019.
+# Yaw stays on the stock PID: its G could not be identified (fit error 45 %).
+Q_INDI_ENABLE 1
+Q_INDI_AXES 27
+Q_INDI_FILT_HZ 12.7
+# hover, per unit mixer input: G_roll 56.7, G_pitch 44.8 rad/s^2
+# (physics check from model.sdf, 2*arm*T_max/I: 56.9 / 44.8); lift motors: tau ~ 0, delay 4 ms
+Q_INDI_RLL_G 56.7
+Q_INDI_PIT_G 44.8
+Q_INDI_YAW_G 0
+Q_INDI_ACT_TC 0
+Q_INDI_ACT_DLY 0.004
+Q_INDI_RLL_K 13.5
+Q_INDI_PIT_K 13.5
+# fixed wing, per unit surface (full travel) at speed scaler 1 (SCALING_SPEED 15 m/s);
+# G = G_ref/scaler^2 held within 1 % at 18.4, 19.9 and 20.8 m/s. Surface servo tau ~ 10 ms
+Q_INDI_FW_RLL_G 16.7
+Q_INDI_FW_PIT_G 12.4
+Q_INDI_FW_TC 0.010
+Q_INDI_FW_RLL_K 10.5
+Q_INDI_FW_PIT_K 10.5

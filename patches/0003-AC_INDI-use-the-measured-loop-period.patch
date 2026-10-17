@@ -1,0 +1,188 @@
+From 869b037b297a12b0ebb80490116a7d8a0dddfd28 Mon Sep 17 00:00:00 2001
+From: TranAnhDuy123 <tranminhhuyen22@gmail.com>
+Date: Fri, 25 Sep 2026 16:19:24 +0700
+Subject: [PATCH 3/3] AC_INDI: use the measured loop period
+
+The JSON SITL loop at SCHED_LOOP_RATE 400 actually runs every 3 ms
+because the physics steps in whole milliseconds. With the nominal
+period the angular-acceleration estimate was 20% too large and the
+filter corners were misplaced. The axis now keeps a smoothed measured
+loop period and recomputes its filters only when it moves by more
+than 2 Hz.
+
+Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>
+---
+ .../AC_AttitudeControl_INDI.cpp               |  5 +--
+ libraries/AC_AttitudeControl/AC_INDI.cpp      | 43 ++++++++++++++-----
+ libraries/AC_AttitudeControl/AC_INDI.h        | 16 ++++---
+ libraries/APM_Control/AP_FW_Controller.cpp    |  5 +--
+ 4 files changed, 47 insertions(+), 22 deletions(-)
+
+diff --git a/libraries/AC_AttitudeControl/AC_AttitudeControl_INDI.cpp b/libraries/AC_AttitudeControl/AC_AttitudeControl_INDI.cpp
+index 56c0b84cbc..bd75eef040 100644
+--- a/libraries/AC_AttitudeControl/AC_AttitudeControl_INDI.cpp
++++ b/libraries/AC_AttitudeControl/AC_AttitudeControl_INDI.cpp
+@@ -52,7 +52,6 @@ void AC_AttitudeControl_INDI::rate_controller_run_dt(const Vector3f& gyro_rads,
+     _rate_gyro_rads = gyro_rads;
+     _rate_gyro_time_us = AP_HAL::micros64();
+ 
+-    const float loop_hz = AP::scheduler().get_loop_rate_hz();
+     const float gyro_hz = AP::ins().get_gyro_filter_hz();
+     const bool spooled = _motors.get_spool_state() == AP_Motors::SpoolState::THROTTLE_UNLIMITED;
+     static const AC_INDI_Params::Axis bits[3] { AC_INDI_Params::MC_ROLL, AC_INDI_Params::MC_PITCH, AC_INDI_Params::MC_YAW };
+@@ -62,12 +61,12 @@ void AC_AttitudeControl_INDI::rate_controller_run_dt(const Vector3f& gyro_rads,
+     float out[3];
+     _active = 0;
+     for (uint8_t i = 0; i < 3; i++) {
+-        _axis[i].configure(loop_hz, gyro_hz, _indi.filt_hz, _indi.act_tc, _indi.act_dly);
++        _axis[i].configure(gyro_hz, _indi.filt_hz, _indi.act_tc, _indi.act_dly);
+         const float u_app = applied_input(i);
+         const bool use_indi = spooled && _indi.axis_enabled(bits[i]) && is_positive(_indi.g[i].get());
+         if (use_indi) {
+             const float nu = _indi.k[i] * (ang_vel_body[i] - gyro_rads[i]);
+-            out[i] = _axis[i].update(gyro_rads[i], u_app, nu, _indi.g[i]);
++            out[i] = _axis[i].update(gyro_rads[i], u_app, nu, _indi.g[i], dt);
+             // keep the PID object consistent: its target is read by the
+             // fixed-wing surfaces slaved to the VTOL rate loop, and a zero
+             // integrator makes a later hand-back to PID bumpless
+diff --git a/libraries/AC_AttitudeControl/AC_INDI.cpp b/libraries/AC_AttitudeControl/AC_INDI.cpp
+index 31a4a0cfa2..9ef8811337 100644
+--- a/libraries/AC_AttitudeControl/AC_INDI.cpp
++++ b/libraries/AC_AttitudeControl/AC_INDI.cpp
+@@ -114,25 +114,34 @@ AC_INDI_Params::AC_INDI_Params()
+     AP_Param::setup_object_defaults(this, var_info);
+ }
+ 
+-void AC_INDI_Axis::configure(float loop_hz, float gyro_filt_hz, float filt_hz, float act_tc, float act_dly)
++void AC_INDI_Axis::configure(float gyro_filt_hz, float filt_hz, float act_tc, float act_dly)
+ {
+-    if (is_equal(loop_hz, _loop_hz) && is_equal(gyro_filt_hz, _gyro_hz) &&
+-        is_equal(filt_hz, _filt_hz) && is_equal(act_tc, _tc) && is_equal(act_dly, _dly)) {
++    if (is_equal(gyro_filt_hz, _gyro_hz) && is_equal(filt_hz, _filt_hz) &&
++        is_equal(act_tc, _tc) && is_equal(act_dly, _dly)) {
+         return;
+     }
+-    _loop_hz = MAX(loop_hz, 50.0f);
+     _gyro_hz = gyro_filt_hz;
+     _filt_hz = MAX(filt_hz, 1.0f);
+     _tc = MAX(act_tc, 0.0f);
+     _dly = MAX(act_dly, 0.0f);
+-    _dt = 1.0f / _loop_hz;
++    _dirty = true;
++}
+ 
+-    _a_act = _dt / (_dt + _tc);
++void AC_INDI_Axis::recompute(float loop_hz)
++{
++    _loop_hz = loop_hz;
++    const float dt = 1.0f / _loop_hz;
++    _a_act = dt / (dt + _tc);
+     const float rc = 1.0f / (M_2PI * _filt_hz);
+-    _a_h = _dt / (_dt + rc);
++    _a_h = dt / (dt + rc);
+     _n_dly = MIN(uint8_t(lrintf(_dly * _loop_hz)), uint8_t(DELAY_MAX - 1));
+-    _gyro_sync.set_cutoff_frequency(_loop_hz, _gyro_hz);
+-    _seeded = false;
++    // a cutoff at or above Nyquist is treated as "no gyro filter"
++    if (is_positive(_gyro_hz) && _gyro_hz < 0.45f * _loop_hz) {
++        _gyro_sync.set_cutoff_frequency(_loop_hz, _gyro_hz);
++    } else {
++        _gyro_sync.set_cutoff_frequency(_loop_hz, 0.0f);
++    }
++    _dirty = false;
+ }
+ 
+ float AC_INDI_Axis::step_actuator(float u_applied)
+@@ -162,8 +171,20 @@ void AC_INDI_Axis::reset(float rate, float u_applied)
+     _seeded = true;
+ }
+ 
+-float AC_INDI_Axis::update(float rate, float u_applied, float nu_in, float G)
++float AC_INDI_Axis::update(float rate, float u_applied, float nu_in, float G, float dt)
+ {
++    // smoothed loop period; filters are recomputed only on a real change
++    if (dt > 0.0005f && dt < 0.05f) {
++        _dt_avg = is_positive(_dt_avg) ? _dt_avg + 0.02f * (dt - _dt_avg) : dt;
++    }
++    if (is_positive(_dt_avg)) {
++        const float hz = 1.0f / _dt_avg;
++        if (_dirty || fabsf(hz - _loop_hz) > 2.0f) {
++            recompute(hz);
++        }
++    } else if (_dirty) {
++        recompute(400.0f);
++    }
+     if (!_seeded) {
+         reset(rate, u_applied);
+     }
+@@ -179,7 +200,7 @@ float AC_INDI_Axis::update(float rate, float u_applied, float nu_in, float G)
+     const float ua = step_actuator(u_applied);
+     const float uh = 0.5f * (ua + _u_prev);
+     _u_prev = ua;
+-    const float ug = is_positive(_gyro_hz) ? _gyro_sync.apply(uh) : uh;
++    const float ug = _gyro_sync.apply(uh);
+     _hu1 += _a_h * (ug - _hu1);
+     _hu2 += _a_h * (_hu1 - _hu2);
+ 
+diff --git a/libraries/AC_AttitudeControl/AC_INDI.h b/libraries/AC_AttitudeControl/AC_INDI.h
+index f0fcd5e0c6..da70a741b7 100644
+--- a/libraries/AC_AttitudeControl/AC_INDI.h
++++ b/libraries/AC_AttitudeControl/AC_INDI.h
+@@ -55,11 +55,15 @@ public:
+ 
+ class AC_INDI_Axis {
+ public:
+-    // (re)configure filters; cheap to call every loop, only acts on a change
+-    void configure(float loop_hz, float gyro_filt_hz, float filt_hz, float act_tc, float act_dly);
++    // set filter/actuator settings; cheap to call every loop, only acts on a change
++    void configure(float gyro_filt_hz, float filt_hz, float act_tc, float act_dly);
+ 
+-    // one INDI step; returns the new normalised effector command
+-    float update(float rate, float u_applied, float nu, float G);
++    // one INDI step; returns the new normalised effector command.
++    // dt is the measured loop period: the loop does not always run at the
++    // nominal SCHED_LOOP_RATE (JSON SITL steps in whole milliseconds, so a
++    // 400 Hz loop actually runs every 3 ms), and both the derivative and the
++    // filter corners must use the real sample period.
++    float update(float rate, float u_applied, float nu, float G, float dt);
+ 
+     // seed all states so a later switch to INDI is bumpless
+     void reset(float rate, float u_applied);
+@@ -71,9 +75,11 @@ private:
+     static constexpr uint8_t DELAY_MAX = 16;
+ 
+     float step_actuator(float u_applied);
++    void recompute(float loop_hz);
+ 
+     float _loop_hz = -1, _gyro_hz = -1, _filt_hz = -1, _tc = -1, _dly = -1;
+-    float _dt = 0.0025f;
++    float _dt_avg = 0;      // smoothed measured loop period
++    bool _dirty = true;
+     float _a_act = 1;       // first-order actuator coefficient
+     float _a_h = 1;         // first-order coefficient of each H pole
+     uint8_t _n_dly = 0;
+diff --git a/libraries/APM_Control/AP_FW_Controller.cpp b/libraries/APM_Control/AP_FW_Controller.cpp
+index 65c5973df3..be13b37206 100644
+--- a/libraries/APM_Control/AP_FW_Controller.cpp
++++ b/libraries/APM_Control/AP_FW_Controller.cpp
+@@ -153,15 +153,14 @@ float AP_FW_Controller::run_rate_control(float desired_rate_degs, float scaler,
+     const float rate_rads = get_measured_rate_rads();
+ 
+     if (_indi_params != nullptr) {
+-        _indi.configure(AP::scheduler().get_loop_rate_hz(), AP::ins().get_gyro_filter_hz(),
+-                        _indi_params->filt_hz, _indi_params->fw_tc, 0.0f);
++        _indi.configure(AP::ins().get_gyro_filter_hz(), _indi_params->filt_hz, _indi_params->fw_tc, 0.0f);
+     }
+     if (_indi_allowed && _indi_params != nullptr && !ground_mode && is_positive(scaler) &&
+         is_positive(_indi_params->fw_g[_indi_axis].get())) {
+         // INDI: effectiveness scales with dynamic pressure, i.e. 1/scaler^2
+         _indi_G = _indi_params->fw_g[_indi_axis] / sq(scaler);
+         const float nu = _indi_params->fw_k[_indi_axis] * (radians(desired_rate_degs) - rate_rads);
+-        const float u = _indi.update(rate_rads, _last_u, nu, _indi_G);
++        const float u = _indi.update(rate_rads, _last_u, nu, _indi_G, AP::scheduler().get_last_loop_time_s());
+         _indi_active = true;
+         _last_u = u;
+         _last_out = u * 45;
+-- 
+2.43.0
+

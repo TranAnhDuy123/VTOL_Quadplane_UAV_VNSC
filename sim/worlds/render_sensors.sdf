@@ -1,0 +1,5 @@
+    <!-- Inserted before </world> by sim/run_gazebo_sitl.sh (WORLD_INSERT) so
+         camera sensors are rendered (with HEADLESS_RENDER=1 no window opens). -->
+    <plugin filename="gz-sim-sensors-system" name="gz::sim::systems::Sensors">
+      <render_engine>ogre2</render_engine>
+    </plugin>

@@ -1,0 +1,204 @@
+<?xml version="1.0" ?>
+<sdf version="1.9">
+  <world name="zephyr_runway">
+    <physics name="1ms" type="ignore">
+      <max_step_size>0.001</max_step_size>
+      <real_time_factor>@RTF@</real_time_factor>
+    </physics>
+
+    <plugin filename="gz-sim-physics-system"
+      name="gz::sim::systems::Physics">
+    </plugin>
+    <plugin filename="gz-sim-user-commands-system"
+      name="gz::sim::systems::UserCommands">
+    </plugin>
+    <plugin filename="gz-sim-scene-broadcaster-system"
+      name="gz::sim::systems::SceneBroadcaster">
+    </plugin>
+    <plugin filename="gz-sim-imu-system"
+      name="gz::sim::systems::Imu">
+    </plugin>
+    <plugin filename="gz-sim-navsat-system"
+      name="gz::sim::systems::NavSat">
+    </plugin>
+    <!-- Lets sim/disturb.py push a torque onto the airframe
+         (/world/zephyr_runway/wrench/persistent, /wrench/clear). -->
+    <plugin filename="gz-sim-apply-link-wrench-system"
+      name="gz::sim::systems::ApplyLinkWrench">
+    </plugin>
+
+    <!-- ======================================================== -->
+    <!-- REALISTIC & DYNAMIC WIND MODEL CONFIGURATION             -->
+    <!-- ======================================================== -->
+    
+    <!-- 1. Define the Global Base Wind Physics Vector -->
+    <!-- Wind velocity in the Gazebo world frame (ENU: +X east, +Y north).
+         The mission flies due north, so a pure +X wind is a pure crosswind.
+         Substituted per run by scripts/run_indi_case.sh. -->
+    <wind>
+      <linear_velocity>@WIND_E@ @WIND_N@ 0.0</linear_velocity>
+    </wind>
+
+    <!-- 2. Configure the Wind Processing & Turbulence Engine Plugin -->
+    <plugin filename="gz-sim-wind-effects-system"
+            name="gz::sim::systems::WindEffects">
+
+      <!-- Do not let this plugin push the aircraft directly.
+           WindEffects approximates the force on a wind-enabled link as
+             F = mass * factor * (wind_velocity - link_velocity)
+           which is a velocity-proportional body drag. For a 2.8 kg aircraft
+           with factor 1 that is 2.8 N per m/s, about 48 N at cruise, against
+           a weight of 27 N: the aircraft simply cannot accelerate, and the
+           forward transition never happens (observed directly - airspeed
+           stalled at 4.6 m/s).
+
+           That approximation exists for objects with no aerodynamic model of
+           their own, such as foliage. This aircraft has a full LiftDrag model
+           on every surface, so the correct path for wind is through the
+           air-relative velocity those plugins compute; adding a body force on
+           top would double-count the drag even if it were the right size.
+
+           Setting the factor to zero keeps the part of this plugin that is
+           wanted - it drives the world wind entity, including the turbulence
+           defined below, which LiftDrag and the ArduPilot plugin both read -
+           and removes the part that is not. -->
+      <force_approximation_scaling_factor>0</force_approximation_scaling_factor>
+
+      
+      <!-- Configuration for Horizontal Wind Data -->
+      <horizontal>
+        <magnitude>
+          <!-- time_for_rise acts as the filter time constant. 
+               A higher value means the wind changes slowly (steady gust fronts). -->
+          <time_for_rise>10.0</time_for_rise>
+          
+          <!-- Gaussian noise creates random velocity turbulence.
+               stddev=1.5 allows gusts to spike up or drop down dynamically. -->
+          <noise type="gaussian">
+            <mean>0.0</mean>
+            <stddev>@TURB_MAG@</stddev>
+          </noise>
+        </magnitude>
+
+        <direction>
+          <!-- Over 5.0 seconds, allow the heading of the wind to shift slightly 
+               so it isn't blowing in a perfectly unnatural straight line. -->
+          <time_for_rise>5.0</time_for_rise>
+          <noise type="gaussian">
+            <mean>0.0</mean>
+            <!-- Minor angle shifts in radians -->
+            <stddev>@TURB_DIR@</stddev> 
+          </noise>
+        </direction>
+      </horizontal>
+
+      <!-- Configuration for Vertical Wind Data (Thermals / Downdrafts) -->
+      <vertical>
+        <magnitude>
+          <time_for_rise>3.0</time_for_rise>
+          <noise type="gaussian">
+            <mean>0.0</mean>
+            <!-- Light vertical turbulence to buff the Quadplane during hover -->
+            <stddev>@TURB_VERT@</stddev> 
+          </noise>
+        </magnitude>
+      </vertical>
+      
+    </plugin>
+    <!-- ======================================================== -->
+
+    <scene>
+      <ambient>1.0 1.0 1.0</ambient>
+      <background>0.8 0.8 0.8</background>
+      <sky></sky>
+    </scene>
+
+    <spherical_coordinates>
+      <latitude_deg>-35.363262</latitude_deg>
+      <longitude_deg>149.165237</longitude_deg>
+      <elevation>584</elevation>
+      <heading_deg>0</heading_deg>
+      <surface_model>EARTH_WGS84</surface_model>
+    </spherical_coordinates>
+
+    <light type="directional" name="sun">
+      <cast_shadows>true</cast_shadows>
+      <pose>0 0 10 0 0 0</pose>
+      <diffuse>0.8 0.8 0.8 1</diffuse>
+      <specular>0.8 0.8 0.8 1</specular>
+      <attenuation>
+        <range>1000</range>
+        <constant>0.9</constant>
+        <linear>0.01</linear>
+        <quadratic>0.001</quadratic>
+      </attenuation>
+      <direction>-0.5 0.1 -0.9</direction>
+    </light>
+
+    <model name="axes">
+      <static>1</static>
+      <link name="link">
+        <visual name="r">
+          <cast_shadows>0</cast_shadows>
+          <pose>5 0 0.1 0 0 0</pose>
+          <geometry>
+            <box>
+              <size>10 0.01 0.01</size>
+            </box>
+          </geometry>
+          <material>
+            <ambient>1 0 0 0.8</ambient>
+            <diffuse>1 0 0 0.8</diffuse>
+            <emissive>1 0 0 0.8</emissive>
+            <specular>0.5 0.5 0.5 0.8</specular>
+          </material>
+        </visual>
+        <visual name="g">
+          <cast_shadows>0</cast_shadows>
+          <pose>0 5 0.1 0 0 0</pose>
+          <geometry>
+            <box>
+              <size>0.01 10 0.01</size>
+            </box>
+          </geometry>
+          <material>
+            <ambient>0 1 0 0.8</ambient>
+            <diffuse>0 1 0 0.8</diffuse>
+            <emissive>0 1 0 0.8</emissive>
+            <specular>0.5 0.5 0.5 0.8</specular>
+          </material>
+        </visual>
+        <visual name="b">
+          <cast_shadows>0</cast_shadows>
+          <pose>0 0 5.1 0 0 0</pose>
+          <geometry>
+            <box>
+              <size>0.01 0.01 10</size>
+            </box>
+          </geometry>
+          <material>
+            <ambient>0 0 1 0.8</ambient>
+            <diffuse>0 0 1 0.8</diffuse>
+            <emissive>0 0 1 0.8</emissive>
+            <specular>0.5 0.5 0.5 0.8</specular>
+          </material>
+        </visual>
+        <sensor name="navsat_sensor" type="navsat">
+          <always_on>1</always_on>
+          <update_rate>1</update_rate>
+        </sensor>
+      </link>
+    </model>
+
+    <include>
+      <uri>model://runway</uri>
+      <pose degrees="true">-29 545 0 0 0 363</pose>
+    </include>
+
+    <include>
+      <uri>model://VTOL_Quadplane</uri>
+      <pose degrees="true">0 0 0.42 0 0 90</pose>
+    </include>
+
+  </world>
+</sdf>

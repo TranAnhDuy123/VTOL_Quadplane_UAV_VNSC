@@ -1,0 +1,7 @@
+# stock ArduPilot clone (rebuild with the commands in README.md)
+ardupilot/
+
+# per-run SITL scratch (the archived log is runs/<name>/flight.BIN)
+runs/*/logs/
+runs/*/terrain/
+runs/*/eeprom.bin

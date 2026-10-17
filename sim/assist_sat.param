@@ -1,0 +1,4 @@
+# Saturation-triggered assist, for PID and INDI alike: when an aileron or the
+# elevator stays at full travel for 100 ms in a fixed-wing mode, the lift motors
+# start (Q_ASSIST_SAT_MS, added on branch indi; 0 = stock behaviour).
+Q_ASSIST_SAT_MS 100

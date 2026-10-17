@@ -1,0 +1,33 @@
+    <!-- Inserted before </world> by sim/run_gazebo_sitl.sh when WORLD_INSERT
+         points here (hover-test recording only). A fixed camera behind and to
+         the right of the hover point (0, 0, ~20 m; the aircraft faces north,
+         +y in ENU), so roll and pitch are both visible. Frames are published on
+         /hover_cam and saved by sim/record_camera.py. -->
+    <plugin filename="gz-sim-sensors-system" name="gz::sim::systems::Sensors">
+      <render_engine>ogre2</render_engine>
+    </plugin>
+    <model name="hover_camera">
+      <static>true</static>
+      <!-- 2.2 m east, 3.8 m south, 0.8 m above the hover point (0, 0, 20.8 in world z),
+           looking at it from 4.5 m: the aircraft fills about 30 % of the frame -->
+      <pose>2.2 -3.8 21.6 0 0.180 2.0956</pose>
+      <link name="link">
+        <sensor name="hover_cam" type="camera">
+          <camera>
+            <horizontal_fov>0.95</horizontal_fov>
+            <image>
+              <width>960</width>
+              <height>540</height>
+            </image>
+            <clip>
+              <near>0.1</near>
+              <far>1000</far>
+            </clip>
+          </camera>
+          <always_on>1</always_on>
+          <update_rate>30</update_rate>
+          <visualize>false</visualize>
+          <topic>hover_cam</topic>
+        </sensor>
+      </link>
+    </model>

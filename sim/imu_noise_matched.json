@@ -1,0 +1,13 @@
+{
+  "_comment": "Matched 20-120 Hz post-filter hover IMU RMS using analysis/imu_noise.py; sensor Gaussian stddev at 1 kHz. Clean motion already above real cannot be reduced by adding noise. Does not reproduce tonal vibration or the real 42 Hz gyro filter/notch; validate on a NEW run.",
+  "gyro_rad_s": [
+    0.04689,
+    0.0,
+    0.01
+  ],
+  "accel_m_s2": [
+    2.20238,
+    2.10099,
+    2.94
+  ]
+}
