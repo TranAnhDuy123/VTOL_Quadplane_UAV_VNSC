@@ -1,0 +1,40 @@
+# Nested Git repositories
+**/.git/
+
+# Build outputs
+**/build/
+**/cmake-build-*/
+**/CMakeFiles/
+*.o
+*.so
+*.a
+
+# ArduPilot and simulation runtime files
+**/logs/
+**/sim/log/
+*.BIN
+*.tlog
+*.tlog.raw
+eeprom.bin
+mav.parm
+
+# Gazebo runtime and cache
+**/.gz/fuel/
+**/.gz/sim/
+*.log
+
+# Temporary and backup files
+*.save
+*.save.*
+*.backup
+*.bak
+*.swp
+*~
+__pycache__/
+*.pyc
+
+# Editors and operating systems
+.vscode/
+.idea/
+.DS_Store
+Thumbs.db

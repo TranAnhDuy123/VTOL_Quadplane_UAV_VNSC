@@ -1,0 +1,281 @@
+diff --git a/libraries/APM_Control/AP_RollController.cpp b/libraries/APM_Control/AP_RollController.cpp
+index 3f6409ba0e..0e170ed8fb 100644
+--- a/libraries/APM_Control/AP_RollController.cpp
++++ b/libraries/APM_Control/AP_RollController.cpp
+@@ -21,6 +21,7 @@
+ #include "AP_RollController.h"
+ #include <AP_AHRS/AP_AHRS.h>
+ #include <AP_Scheduler/AP_Scheduler.h>
++#include <AP_Logger/AP_Logger.h>
+ 
+ extern const AP_HAL::HAL& hal;
+ 
+@@ -157,6 +158,38 @@ const AP_Param::GroupInfo AP_RollController::var_info[] = {
+     // @User: Advanced
+     AP_GROUPINFO("_ANGLE_P", 11, AP_RollController, angle_p, 0.0),
+ 
++    // @Param: _INDI_EN
++    // @DisplayName: Roll INDI controller mode
++    // @Description: Selects PID, INDI shadow logging, or active INDI roll-rate control.
++    // @Values: 0:PID,1:Shadow,2:Active
++    // @User: Advanced
++    AP_GROUPINFO("_INDI_EN", 12, AP_RollController, indi_enable, 0),
++
++    // @Param: _INDI_KRATE
++    // @DisplayName: Roll INDI rate error gain
++    // @Description: Converts roll-rate error into the desired roll angular acceleration for the INDI controller.
++    // @Range: 0.1 20.0
++    // @Increment: 0.1
++    // @User: Advanced
++    AP_GROUPINFO("_INDI_KRATE", 13, AP_RollController, indi_krate, 4.0f),
++
++    // @Param: _INDI_G1
++    // @DisplayName: Roll INDI control effectiveness
++    // @Description: Estimated roll angular acceleration produced per degree of aileron deflection. This value must be identified for the aircraft.
++    // @Range: 1.0 1000.0
++    // @Increment: 1.0
++    // @User: Advanced
++    AP_GROUPINFO("_INDI_G1", 14, AP_RollController, indi_g1, 100.0f),
++
++    // @Param: _INDI_FILT
++    // @DisplayName: Roll INDI filter frequency
++    // @Description: Low-pass filter cutoff frequency used for roll rate, roll acceleration and actuator command signals.
++    // @Range: 1.0 30.0
++    // @Units: Hz
++    // @Increment: 0.5
++    // @User: Advanced
++    AP_GROUPINFO("_INDI_FILT", 15, AP_RollController, indi_filter_hz, 8.0f),
++
+     AP_GROUPEND
+ };
+ 
+@@ -216,6 +249,171 @@ bool AP_RollController::should_apply_rate_limits() const
+     return !in_recovery;
+ }
+ 
++/*
++  Temporary INDI entry point.
++
++  For this first wiring test it deliberately calls the original PID
++  controller. The actual INDI equations will be added only after
++  this version compiles and the new parameter is visible in SITL.
++*/
++float AP_RollController::run_indi_rate_control(float desired_rate_degs,
++                                               float scaler,
++                                               bool disable_integrator,
++                                               bool ground_mode)
++{
++    /*
++      PID always runs in parallel. It controls the aircraft in shadow
++      mode and remains available as the fallback controller.
++    */
++    const float pid_output_cd =
++        run_rate_control(desired_rate_degs,
++                         scaler,
++                         disable_integrator,
++                         ground_mode);
++
++    const float pid_output_deg = pid_output_cd * 0.01f;
++    const float measured_rate_degs =
++        degrees(get_measured_rate_rads());
++
++    const float dt = AP::scheduler().get_loop_period_s();
++
++    const int8_t indi_mode = indi_enable.get();
++
++    /*
++      Active INDI is blocked on the ground and while the aircraft
++      is considered underspeed.
++    */
++    const bool active_requested =
++        indi_mode >= 2 &&
++        !ground_mode &&
++        !is_underspeed();
++
++    const float cutoff_hz =
++        MAX(indi_filter_hz.get(), 0.1f);
++
++    const float filter_term =
++        M_2PI * cutoff_hz * dt;
++
++    const float alpha =
++        constrain_float(filter_term / (1.0f + filter_term),
++                        0.0f,
++                        1.0f);
++
++    // Initialise all states from the PID output.
++    if (!indi_initialized || dt <= 0.0f) {
++        indi_rate_filtered_degs = measured_rate_degs;
++        indi_rate_filtered_prev_degs = measured_rate_degs;
++        indi_accel_filtered_degss = 0.0f;
++
++        indi_actuator_filtered_deg = pid_output_deg;
++        indi_last_output_deg = pid_output_deg;
++
++        indi_active_last = false;
++        indi_initialized = true;
++
++        return pid_output_cd;
++    }
++
++    // Filter measured roll rate.
++    indi_rate_filtered_degs +=
++        alpha *
++        (measured_rate_degs -
++         indi_rate_filtered_degs);
++
++    /*
++      Differentiate the filtered roll rate. Do not add another
++      low-pass filter because Act uses one filter of the same order.
++    */
++    indi_accel_filtered_degss =
++        (indi_rate_filtered_degs -
++         indi_rate_filtered_prev_degs) / dt;
++
++    indi_rate_filtered_prev_degs =
++        indi_rate_filtered_degs;
++
++    /*
++      Filter the command actually returned during the preceding
++      controller loop—not always the PID command.
++    */
++    indi_actuator_filtered_deg +=
++        alpha *
++        (indi_last_output_deg -
++         indi_actuator_filtered_deg);
++
++    const float desired_accel_degss =
++        indi_krate.get() *
++        (desired_rate_degs -
++         indi_rate_filtered_degs);
++
++    const float g1_degss_per_deg =
++        MAX(indi_g1.get(), 1.0f);
++
++    // Unconstrained INDI command, retained in the log as Cmd.
++    const float indi_cmd_deg =
++        indi_actuator_filtered_deg +
++        (desired_accel_degss -
++         indi_accel_filtered_degss) /
++        g1_degss_per_deg;
++
++    // Equivalent aileron command must remain within ArduPlane limits.
++    const float indi_cmd_limited_deg =
++        constrain_float(indi_cmd_deg,
++                        -45.0f,
++                        45.0f);
++
++    /*
++      Require active mode during two consecutive loops. The first
++      loop after changing 1 -> 2 still returns PID, providing a
++      bumpless initialisation of the active INDI state.
++    */
++    const bool indi_active =
++        active_requested && indi_active_last;
++
++    const float output_deg =
++        indi_active ?
++        indi_cmd_limited_deg :
++        pid_output_deg;
++
++    /*
++      Mode recorded in the log:
++      1 = PID output/shadow INDI
++      2 = active INDI output
++    */
++    const uint8_t actual_mode =
++        indi_active ? 2U : 1U;
++
++    const uint32_t now_ms = AP_HAL::millis();
++
++    if (now_ms - indi_last_log_ms >= 20U) {
++        indi_last_log_ms = now_ms;
++
++        AP::logger().WriteStreaming(
++            "INDI",
++            "TimeUS,DesR,RawR,FltR,DesA,Acc,Act,PID,Cmd,Out,Mode",
++            "QfffffffffB",
++            AP_HAL::micros64(),
++            desired_rate_degs,
++            measured_rate_degs,
++            indi_rate_filtered_degs,
++            desired_accel_degss,
++            indi_accel_filtered_degss,
++            indi_actuator_filtered_deg,
++            pid_output_deg,
++            indi_cmd_deg,
++            output_deg,
++            actual_mode);
++    }
++
++    /*
++      Save the command actually returned. This becomes the actuator
++      state used by INDI during the following loop.
++    */
++    indi_last_output_deg = output_deg;
++    indi_active_last = active_requested;
++
++    return output_deg * 100.0f;
++}
++
+ /*
+  Function returns an equivalent aileron deflection in centi-degrees in the range from -4500 to 4500
+  A positive demand is up
+@@ -241,9 +439,20 @@ float AP_RollController::run_axis_rate_control(float desired_rate_degs, float sc
+     }
+ 
+     // in_recovery flag is only valid for single loop, clear it
++        // in_recovery flag is only valid for single loop, clear it
+     in_recovery = false;
+ 
+-    return run_rate_control(desired_rate_degs, scaler, disable_integrator, ground_mode);
++    if (indi_enable.get() != 0) {
++        return run_indi_rate_control(desired_rate_degs,
++                                     scaler,
++                                     disable_integrator,
++                                     ground_mode);
++    }
++    indi_initialized = false;
++    return run_rate_control(desired_rate_degs,
++                            scaler,
++                            disable_integrator,
++                            ground_mode);
+ }
+ 
+ /*
+diff --git a/libraries/APM_Control/AP_RollController.h b/libraries/APM_Control/AP_RollController.h
+index 39542aaf1b..5731e931e5 100644
+--- a/libraries/APM_Control/AP_RollController.h
++++ b/libraries/APM_Control/AP_RollController.h
+@@ -24,6 +24,10 @@ public:
+ 
+ private:
+     float run_axis_rate_control(float desired_rate_degs, float scaler, bool disable_integrator, bool ground_mode) override;
++    float run_indi_rate_control(float desired_rate_degs,
++                                float scaler,
++                                bool disable_integrator,
++                                bool ground_mode);
+ 
+     // Return true if the airspeed should be considered as under speed
+     bool is_underspeed() const override;
+@@ -43,5 +47,20 @@ private:
+     // Return negative rate limit in deg per second (as a positive number) zero if disabled
+     float get_negative_rate_limit_degs() const override;
+ 
++    AP_Int8 indi_enable;
++    AP_Float indi_krate;
++    AP_Float indi_g1;
++    AP_Float indi_filter_hz;
++
++    // INDI filtered states
++    bool indi_initialized = false;
++    float indi_rate_filtered_degs = 0.0f;
++    float indi_rate_filtered_prev_degs = 0.0f;
++    float indi_accel_filtered_degss = 0.0f;
++    float indi_actuator_filtered_deg = 0.0f;
++    float indi_last_output_deg = 0.0f;
++    bool indi_active_last = false;
++    uint32_t indi_last_log_ms = 0;
++
+     bool in_recovery;
+ };
